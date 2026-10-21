@@ -21,13 +21,14 @@
 
   会自动打开浏览器 → http://localhost:8501
 """
+import os
 import streamlit as st
 import requests
 
 st.set_page_config(page_title="AI知识库问答", page_icon=":books:")
 st.title("AI 智能知识库问答系统")
 
-API_URL = "http://127.0.0.1:8012"
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8012")
 
 # ============================================================
 # 左侧边栏：文件上传

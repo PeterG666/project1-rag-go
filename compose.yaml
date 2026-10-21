@@ -1,0 +1,26 @@
+name: personal-rag
+
+services:
+  backend:
+    image: rag-backend:v1
+    ports:
+      - "127.0.0.1:18012:8012"
+    environment:
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?请在 .env 中配置 DEEPSEEK_API_KEY}"
+      HF_HOME: /models
+    volumes:
+      - knowledge-data:/app/knowledge
+      - chroma-data:/app/chroma_db
+      - hf-cache:/models
+   
+  frontend:
+    image: rag-frontend:v1
+    ports:
+      - "127.0.0.1:18512:8501"
+    environment:
+      API_URL: http://backend:8012
+
+volumes:
+  knowledge-data:
+  chroma-data: 
+  hf-cache: 

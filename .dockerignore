@@ -1,0 +1,13 @@
+venv/
+.git/
+.idea/
+__pycache__/
+*.pyc
+.env
+.env.*
+knowledge/
+chroma_db/
+.gitignore
+*.md
+
+
