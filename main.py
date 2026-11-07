@@ -12,6 +12,9 @@
 
 import os, shutil
 import chromadb
+from time import perf_counter
+from threading import Lock
+from cache_service import build_cache_key, get_cached_response, save_cached_response,get_knowledge_version
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
@@ -27,6 +30,13 @@ app = FastAPI(title="AI知识库问答系统")
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
 API_BASE = "https://api.deepseek.com"
 KNOWLEDGE_DIR = "./knowledge"
+knowledge_lock = Lock()
+cache_stats = {
+    'hit':0,
+    'miss':0,
+    'bypass':0,
+    'model_calls':0
+}
 
 os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
 
@@ -46,7 +56,7 @@ splitter = RecursiveCharacterTextSplitter(
 )
 
 # ---- 向量库（初始为空，上传文件后才填充）----
-vector_store = None       # None 表示还没有创建向量库，启动时不构建，等上传文件后再构建，这叫懒加载
+vector_store = None       # None 表示还没有创建向量库，启动时不构建，等上传文件后再构建，即懒加载
 
 
 # ============================================================
@@ -56,6 +66,7 @@ vector_store = None       # None 表示还没有创建向量库，启动时不�
 def parse_file(file_path: str) -> str:
     """
     解析文件，返回纯文本内容。
+    
     支持 .txt / .md / .pdf
     """
     ext = os.path.splitext(file_path)[1].lower()
@@ -157,6 +168,12 @@ def root():
     }
 
 
+@app.get("/cache/stats")
+def get_cache_stats():
+    with knowledge_lock:
+        return cache_stats.copy()
+
+
 @app.get("/status")
 def status():
     """查看知识库当前状态"""
@@ -190,18 +207,18 @@ async def upload_file(file: UploadFile = File(...)):
     # 先验证：文件内容不能为空（先判断，再写盘，避免留下空文件垃圾）
     if not content:
         raise HTTPException(status_code=400, detail="文件内容为空，请检查后重新上传")
+    with knowledge_lock:
+        with open(save_path, "wb") as f:
+            f.write(content)
+        # 重建向量库
+        chunk_count, error = rebuild_vector_store()
+        if error:
+            return {"message": "文件已保存，但索引构建失败", "error": error}
 
-    with open(save_path, "wb") as f:
-        f.write(content)
-    # 重建向量库
-    chunk_count, error = rebuild_vector_store()
-    if error:
-        return {"message": "文件已保存，但索引构建失败", "error": error}
-
-    return {
-        "message": f"文件 {file.filename} 上传成功！",
-        "chunks_created": chunk_count,
-    }
+        return {
+            "message": f"文件 {file.filename} 上传成功！",
+            "chunks_created": chunk_count,
+        }
 
 
 
@@ -218,53 +235,80 @@ SYSTEM_PROMPT = (
 @app.delete("/files/{filename}")
 def delete_file(filename: str):
     file_path = os.path.join(KNOWLEDGE_DIR, filename)
+    with knowledge_lock:
 
-    # 先验证：文件存在才删除（先判断，再动手）
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"文件 {filename} 不存在")
+       # 先验证：文件存在才删除（先判断，再动手）
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"文件 {filename} 不存在")
 
-    os.remove(file_path)
-    rebuild_vector_store()
-    return {"message": f"文件 {filename} 已删除"}
+        os.remove(file_path)
+        rebuild_vector_store()
+        return {"message": f"文件 {filename} 已删除"}
 
 
 @app.post("/ask")
 def ask(req: AskRequest):
     """向知识库提问"""
-    if vector_store is None:
-        # 尝试自动构建
-        chunk_count, error = rebuild_vector_store()
-        if error:
-            raise HTTPException(status_code=400, detail="知识库为空，请先上传文件。")
+    started_at = perf_counter()
+    with knowledge_lock:
+        if vector_store is None:
+            # 尝试自动构建
+            chunk_count, error = rebuild_vector_store()
+            if error:
+                raise HTTPException(status_code=400, detail="知识库为空，请先上传文件。")
 
-    # 步骤 1：检索
-    related_docs = vector_store.similarity_search(req.question, k=3)
+        kb_version=get_knowledge_version(KNOWLEDGE_DIR)
+        cache_key=build_cache_key(req.question,req.temperature,kb_version)
+        cached,cache_status = get_cached_response(cache_key)
+        cache_stats[cache_status] += 1
+        if cached is not None:
+            return {
+                "answer":cached["answer"],
+                "sources":cached["sources"],
+                "tokens_used":0,
+                "generation_tokens_used":cached["generation_tokens_used"],
+                "cache_status":"hit",
+                'response_time_ms':round((perf_counter() - started_at) * 1000, 2)
+            }
 
-    context_parts = []
-    sources = []
-    for i, doc in enumerate(related_docs):
-        context_parts.append(f"[片段{i+1}] {doc.page_content}")
-        # 提取来源信息
-        content = doc.page_content
-        if content.startswith("[来源："):
-            source_name = content.split("]")[0].replace("[来源：", "")
-            sources.append(source_name)
 
-    context = "\n\n".join(context_parts)
+        # 步骤 1：检索
+        related_docs = vector_store.similarity_search(req.question, k=3)
 
-    # 步骤 2：调用 LLM
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE)
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
-            {"role": "user", "content": req.question},
-        ],
-        temperature=req.temperature,
-    )
+        context_parts = []
+        sources = []
+        for i, doc in enumerate(related_docs):
+            context_parts.append(f"[片段{i+1}] {doc.page_content}")
+            # 提取来源信息
+            content = doc.page_content
+            if content.startswith("[来源："):
+                source_name = content.split("]")[0].replace("[来源：", "")
+                sources.append(source_name)
 
-    return {
-        "answer": response.choices[0].message.content,
-        "sources": list(set(sources)),       # 去重
-        "tokens_used": response.usage.total_tokens,
-    }
+        context = "\n\n".join(context_parts)
+
+        # 步骤 2：调用 LLM
+        client = OpenAI(api_key=API_KEY, base_url=API_BASE)
+        cache_stats["model_calls"] += 1
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
+                {"role": "user",
+                 "content": req.question},
+            ],
+            temperature=req.temperature,
+        )
+
+        result = {
+            "answer": response.choices[0].message.content,
+            "sources": list(set(sources)),       # 去重
+            "tokens_used": response.usage.total_tokens,
+            "generation_tokens_used": response.usage.total_tokens,
+            "cache_status": cache_status
+        }
+
+        if cache_status != 'bypass':
+            save_cached_response(cache_key, result)
+        result["response_time_ms"] = round((perf_counter() - started_at) * 1000, 2)
+        return result

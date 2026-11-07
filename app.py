@@ -128,7 +128,22 @@ if ask_button and question:
                     for s in data["sources"]:
                         st.caption(f"  - {s}")
 
-                st.caption(f"Token 消耗：{data['tokens_used']}")
+                cache_labels = {
+                    "hit": "命中缓存，本次未调用模型",
+                    "miss": "未命中缓存，本次已调用模型",
+                    "bypass": "缓存暂不可用，已通过原有问答流程生成答案",
+                }
+                cache_status = data.get("cache_status")
+                if cache_status in cache_labels:
+                    st.caption(cache_labels[cache_status])
+
+                current_tokens = data.get("tokens_used", 0)
+                generation_tokens = data.get("generation_tokens_used", current_tokens)
+                st.caption(
+                    f"本次 Token：{current_tokens} ｜ 原始生成 Token：{generation_tokens}"
+                )
+                if data.get("response_time_ms") is not None:
+                    st.caption(f"本次后端处理耗时：{data['response_time_ms']} ms")
             else:
                 st.error(f"请求失败：{resp.text}")
         except requests.exceptions.ConnectionError:

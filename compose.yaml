@@ -6,6 +6,7 @@ services:
     ports:
       - "127.0.0.1:18012:8012"
     environment:
+      REDIS_HOST: redis
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?请在 .env 中配置 DEEPSEEK_API_KEY}"
       HF_HOME: /models
     volumes:
@@ -20,6 +21,15 @@ services:
     environment:
       API_URL: http://backend:8012
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      
 volumes:
   knowledge-data:
   chroma-data: 

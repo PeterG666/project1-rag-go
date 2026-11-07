@@ -10,3 +10,4 @@ sentence-transformers
 openai
 python-multipart
 streamlit
+redis
